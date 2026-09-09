@@ -11,12 +11,16 @@ import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationContext;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.listener.KafkaMessageListenerContainer;
 import org.springframework.kafka.listener.MessageListener;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
@@ -32,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 
+
 @SpringBootTest(
         properties = {
                 "spring.kafka.listener.auto-startup=true",
@@ -44,6 +49,9 @@ class OrderEventPoisonMessageIntegrationTest {
 
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Autowired
+    private ApplicationContext applicationContext;
 
     @MockitoBean
     private OrderEventProcessingService processingService;
@@ -84,6 +92,99 @@ class OrderEventPoisonMessageIntegrationTest {
     }
 
 
+    /*
+     * Wait until the application's REAL order-events
+     * listener actually owns a Kafka partition.
+     *
+     * This replaces Thread.sleep(2000).
+     */
+    private void waitForMainKafkaListenerAssignment()
+            throws InterruptedException {
+
+        KafkaListenerEndpointRegistry registry =
+                applicationContext.getBean(
+                        KafkaListenerEndpointRegistry.class
+                );
+
+        long deadline =
+                System.currentTimeMillis()
+                        + 20_000;
+
+        while (System.currentTimeMillis() < deadline) {
+
+            for (MessageListenerContainer listenerContainer :
+                    registry.getListenerContainers()) {
+
+                String[] topics =
+                        listenerContainer
+                                .getContainerProperties()
+                                .getTopics();
+
+                if (topics == null) {
+                    continue;
+                }
+
+                boolean orderEventsListener =
+                        false;
+
+                for (String topic : topics) {
+
+                    if ("order-events".equals(topic)) {
+                        orderEventsListener = true;
+                        break;
+                    }
+                }
+
+                if (!orderEventsListener) {
+                    continue;
+                }
+
+                if (listenerContainer
+                        instanceof ConcurrentMessageListenerContainer<?, ?>
+                        concurrentContainer) {
+
+                    int totalAssigned =
+                            concurrentContainer
+                                    .getContainers()
+                                    .stream()
+                                    .mapToInt(
+                                            child ->
+                                                    child
+                                                            .getAssignedPartitions()
+                                                            .size()
+                                    )
+                                    .sum();
+
+                    if (totalAssigned > 0) {
+
+                        System.out.println(
+                                "\nMain order-events listener ready. "
+                                        + "Assigned partitions: "
+                                        + totalAssigned
+                                        + "\n"
+                        );
+
+                        return;
+                    }
+
+                } else if (!listenerContainer
+                        .getAssignedPartitions()
+                        .isEmpty()) {
+
+                    return;
+                }
+            }
+
+            Thread.sleep(100);
+        }
+
+        fail(
+                "Main order-events Kafka listener did not receive "
+                        + "a partition assignment within 20 seconds"
+        );
+    }
+
+
     @Test
     void shouldContinueProcessingAfterPoisonMessageIsSentToDlt()
             throws Exception {
@@ -113,56 +214,48 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
         /*
-         * Wait for our DLT observer to be ready.
+         * Wait until the test-only DLT observer
+         * actually owns a DLT partition.
          */
         long assignmentDeadline =
-                System.currentTimeMillis() + 10_000;
+                System.currentTimeMillis()
+                        + 10_000;
 
         while (
-                dltContainer.getAssignedPartitions().isEmpty()
+                dltContainer
+                        .getAssignedPartitions()
+                        .isEmpty()
                         &&
-                        System.currentTimeMillis() < assignmentDeadline
+                        System.currentTimeMillis()
+                                < assignmentDeadline
         ) {
 
             Thread.sleep(100);
         }
 
         assertFalse(
-                dltContainer.getAssignedPartitions().isEmpty(),
+                dltContainer
+                        .getAssignedPartitions()
+                        .isEmpty(),
                 "DLT consumer did not receive partition assignment"
         );
 
 
         try {
 
-            /*
-             * Give the application's Kafka listener
-             * a short startup window.
-             */
-            Thread.sleep(2000);
-
-
-            /*
-             * Event A will permanently fail.
-             */
             String poisonEventId =
                     "poison-"
                             + System.nanoTime();
 
-
-            /*
-             * Event B will succeed.
-             */
             String goodEventId =
                     "good-"
                             + System.nanoTime();
 
 
             /*
-             * SAME KEY.
+             * Both records use the SAME Kafka key.
              *
-             * Therefore both records should be sent
-             * to the same Kafka partition.
+             * Therefore both must go to the same partition.
              */
             String key =
                     "product-777";
@@ -195,40 +288,40 @@ class OrderEventPoisonMessageIntegrationTest {
             AtomicInteger poisonAttempts =
                     new AtomicInteger(0);
 
-
             AtomicInteger goodAttempts =
                     new AtomicInteger(0);
 
 
             /*
-             * Configure our mocked business service.
+             * Configure business processing behavior.
+             *
+             * Poison event:
+             * always fails.
+             *
+             * Good event:
+             * succeeds immediately.
              */
             doAnswer(invocation -> {
 
                 OrderEvent event =
                         invocation.getArgument(0);
 
+                if (event == null) {
+                    return null;
+                }
 
-                /*
-                 * EVENT A
-                 *
-                 * Always fail.
-                 */
-                if (
-                        poisonEventId.equals(
-                                event.getEventId()
-                        )
-                ) {
+
+                if (poisonEventId.equals(
+                        event.getEventId()
+                )) {
 
                     int attempt =
                             poisonAttempts.incrementAndGet();
-
 
                     System.out.println(
                             "Poison event attempt #"
                                     + attempt
                     );
-
 
                     throw new RuntimeException(
                             "Permanent simulated failure"
@@ -236,33 +329,24 @@ class OrderEventPoisonMessageIntegrationTest {
                 }
 
 
-                /*
-                 * EVENT B
-                 *
-                 * Always succeed.
-                 */
-                if (
-                        goodEventId.equals(
-                                event.getEventId()
-                        )
-                ) {
+                if (goodEventId.equals(
+                        event.getEventId()
+                )) {
 
                     int attempt =
                             goodAttempts.incrementAndGet();
-
 
                     System.out.println(
                             "Good event processed - attempt #"
                                     + attempt
                     );
 
-
                     return null;
                 }
 
 
                 /*
-                 * Ignore unrelated events.
+                 * Ignore records unrelated to this test.
                  */
                 return null;
 
@@ -274,8 +358,18 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
             /*
+             * IMPORTANT:
+             *
+             * Do not publish until the real
+             * OrderEventConsumer has joined Kafka
+             * and owns a partition.
+             */
+            waitForMainKafkaListenerAssignment();
+
+
+            /*
              * =====================================================
-             * SEND POISON EVENT FIRST
+             * SEND POISON EVENT
              * =====================================================
              */
             var poisonSendResult =
@@ -296,7 +390,6 @@ class OrderEventPoisonMessageIntegrationTest {
                             .getRecordMetadata()
                             .partition();
 
-
             long poisonOffset =
                     poisonSendResult
                             .getRecordMetadata()
@@ -308,15 +401,18 @@ class OrderEventPoisonMessageIntegrationTest {
             );
 
             System.out.println(
-                    "Event ID  : " + poisonEventId
+                    "Event ID  : "
+                            + poisonEventId
             );
 
             System.out.println(
-                    "Partition : " + poisonPartition
+                    "Partition : "
+                            + poisonPartition
             );
 
             System.out.println(
-                    "Offset    : " + poisonOffset
+                    "Offset    : "
+                            + poisonOffset
             );
 
             System.out.println(
@@ -325,15 +421,12 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
             /*
-             * Wait until the poison event appears
-             * in the DLT.
+             * The poison event should:
              *
-             * This means:
-             *
-             * attempt #1 failed
-             * retry #1 failed
-             * retry #2 failed
-             * recovery happened
+             * attempt #1
+             * retry #1
+             * retry #2
+             * DLT
              */
             ConsumerRecord<String, String> poisonDltRecord =
                     waitForSpecificDltRecord(
@@ -350,19 +443,13 @@ class OrderEventPoisonMessageIntegrationTest {
             );
 
 
-            /*
-             * Based on our configured:
-             *
-             * FixedBackOff(2000L, 2L)
-             *
-             * we expect:
-             *
-             * 1 initial attempt
-             * +
-             * 2 retries
-             * =
-             * 3 total attempts.
-             */
+            assertEquals(
+                    key,
+                    poisonDltRecord.key(),
+                    "Poison event Kafka key should be preserved in DLT"
+            );
+
+
             assertEquals(
                     3,
                     poisonAttempts.get(),
@@ -372,11 +459,11 @@ class OrderEventPoisonMessageIntegrationTest {
 
             /*
              * =====================================================
-             * SEND GOOD EVENT SECOND
+             * SEND GOOD EVENT
              * =====================================================
              *
-             * We intentionally send this only AFTER we know
-             * Event A was recovered to the DLT.
+             * This occurs after the poison event has been
+             * successfully recovered to the DLT.
              */
             var goodSendResult =
                     kafkaTemplate
@@ -396,7 +483,6 @@ class OrderEventPoisonMessageIntegrationTest {
                             .getRecordMetadata()
                             .partition();
 
-
             long goodOffset =
                     goodSendResult
                             .getRecordMetadata()
@@ -408,15 +494,18 @@ class OrderEventPoisonMessageIntegrationTest {
             );
 
             System.out.println(
-                    "Event ID  : " + goodEventId
+                    "Event ID  : "
+                            + goodEventId
             );
 
             System.out.println(
-                    "Partition : " + goodPartition
+                    "Partition : "
+                            + goodPartition
             );
 
             System.out.println(
-                    "Offset    : " + goodOffset
+                    "Offset    : "
+                            + goodOffset
             );
 
             System.out.println(
@@ -425,10 +514,7 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
             /*
-             * This assertion is extremely important.
-             *
-             * We are trying to prove that the consumer
-             * moved forward within the SAME partition.
+             * Same key must produce to the same partition.
              */
             assertEquals(
                     poisonPartition,
@@ -438,8 +524,8 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
             /*
-             * Since Event B was produced later to the
-             * same partition, its offset must be greater.
+             * The second event must appear later in
+             * that same partition.
              */
             assertTrue(
                     goodOffset > poisonOffset,
@@ -448,7 +534,7 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
             /*
-             * Now wait for Event B to actually be processed.
+             * Wait for Event B to actually be consumed.
              */
             long goodProcessingDeadline =
                     System.currentTimeMillis()
@@ -467,10 +553,8 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
             /*
-             * THIS is the core assertion.
-             *
-             * If the poison record permanently blocked
-             * the partition, this would remain zero.
+             * This proves the poison message did NOT
+             * permanently block the Kafka partition.
              */
             assertEquals(
                     1,
@@ -541,30 +625,25 @@ class OrderEventPoisonMessageIntegrationTest {
 
 
     /*
-     * Search the DLT queue for one particular
-     * logical event.
+     * Search the shared DLT queue for THIS
+     * logical event only.
      *
-     * Other DLT records are ignored.
+     * Records created by other tests are ignored.
      */
-    private ConsumerRecord<String, String> waitForSpecificDltRecord(
+    private ConsumerRecord<String, String>
+    waitForSpecificDltRecord(
             BlockingQueue<ConsumerRecord<String, String>> records,
             String eventId,
             long timeout,
             TimeUnit timeUnit
-    )
-            throws InterruptedException {
+    ) throws InterruptedException {
 
         long deadline =
                 System.currentTimeMillis()
-                        + timeUnit.toMillis(
-                        timeout
-                );
+                        + timeUnit.toMillis(timeout);
 
 
-        while (
-                System.currentTimeMillis()
-                        < deadline
-        ) {
+        while (System.currentTimeMillis() < deadline) {
 
             long remaining =
                     deadline
@@ -591,14 +670,15 @@ class OrderEventPoisonMessageIntegrationTest {
             }
 
 
+            /*
+             * Do not accept unrelated DLT messages.
+             */
             if (
                     record.value() != null
                             &&
                             record
                                     .value()
-                                    .contains(
-                                            eventId
-                                    )
+                                    .contains(eventId)
             ) {
 
                 return record;

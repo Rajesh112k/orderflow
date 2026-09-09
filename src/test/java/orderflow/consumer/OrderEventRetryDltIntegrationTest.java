@@ -11,67 +11,109 @@ import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationContext;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.listener.KafkaMessageListenerContainer;
 import org.springframework.kafka.listener.MessageListener;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.*;
+
 
 @SpringBootTest(
         properties = {
-                "spring.kafka.listener.auto-startup=true"
+                "spring.kafka.listener.auto-startup=true",
+                "spring.kafka.consumer.auto-offset-reset=latest",
+
+                /*
+                 * IMPORTANT:
+                 *
+                 * The integration test must have its own
+                 * application consumer group.
+                 *
+                 * It must not compete with:
+                 *
+                 * orderflow-consumer
+                 *
+                 * which may be used by another running
+                 * OrderFlow application.
+                 */
+                "orderflow.kafka.consumer.group-id="
+                        + "orderflow-retry-success-main-consumer"
         }
 )
+
 @ActiveProfiles("test")
 class OrderEventRetryDltIntegrationTest {
+
 
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
 
 
     /*
-     * Replace the real processing service with a Mockito mock.
+     * We use ApplicationContext to retrieve Spring Kafka's
+     * KafkaListenerEndpointRegistry.
      *
-     * Real:
+     * The registry allows the test to check whether the real
+     * application @KafkaListener has actually received a
+     * Kafka partition before publishing the test event.
+     */
+    @Autowired
+    private ApplicationContext applicationContext;
+
+
+    /*
+     * Only the business processing service is mocked.
+     *
+     * Everything else remains real:
+     *
      * Kafka
      * KafkaTemplate
-     * @KafkaListener
-     * Jackson deserialization
+     * OrderEventConsumer
+     * Jackson
      * DefaultErrorHandler
-     * Retry mechanism
+     * retry mechanism
      * DeadLetterPublishingRecoverer
-     * DLT topic
-     *
-     * Mocked:
-     * OrderEventProcessingService
      */
     @MockitoBean
     private OrderEventProcessingService processingService;
 
 
     /*
-     * Creates a separate Kafka consumer used only by this test.
+     * ============================================================
+     * DLT TEST CONSUMER FACTORY
+     * ============================================================
      *
-     * This consumer listens to order-events.DLT.
+     * This creates a Kafka consumer used only by this test.
+     *
+     * Its purpose is to watch:
+     *
+     * order-events.DLT
+     *
+     * and verify that our event does NOT reach the DLT after
+     * succeeding during retry.
      */
-    private ConsumerFactory<String, String> createDltConsumerFactory() {
+    private ConsumerFactory<String, String>
+    createDltConsumerFactory() {
 
         Map<String, Object> props =
                 new HashMap<>();
@@ -84,21 +126,23 @@ class OrderEventRetryDltIntegrationTest {
 
 
         /*
-         * Unique consumer group for every test execution.
+         * Unique DLT consumer group for every test execution.
          *
-         * This prevents offsets from previous test runs
-         * from interfering with this run.
+         * This prevents committed offsets from previous test
+         * runs from affecting this run.
          */
         props.put(
                 ConsumerConfig.GROUP_ID_CONFIG,
-                "orderflow-retry-dlt-test-"
+                "orderflow-retry-success-dlt-"
                         + UUID.randomUUID()
         );
 
 
         /*
-         * Only consume DLT records created after
-         * this test consumer starts.
+         * Start observing the DLT from its current end.
+         *
+         * We only care about DLT records produced after this
+         * test observer starts.
          */
         props.put(
                 ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
@@ -118,30 +162,287 @@ class OrderEventRetryDltIntegrationTest {
         );
 
 
-        return new DefaultKafkaConsumerFactory<>(props);
+        return new DefaultKafkaConsumerFactory<>(
+                props
+        );
     }
 
 
+    /*
+     * ============================================================
+     * WAIT FOR APPLICATION KAFKA LISTENER
+     * ============================================================
+     *
+     * Previously this test used:
+     *
+     * Thread.sleep(2000)
+     *
+     * That is not reliable.
+     *
+     * A slow CI machine may require more than two seconds for:
+     *
+     * consumer creation
+     *      ↓
+     * group join
+     *      ↓
+     * rebalance
+     *      ↓
+     * partition assignment
+     *
+     * Therefore we now wait for an ACTUAL partition assignment
+     * instead of guessing how long startup takes.
+     */
+    private void waitForMainKafkaListenerAssignment()
+            throws InterruptedException {
+
+        KafkaListenerEndpointRegistry registry =
+                applicationContext.getBean(
+                        KafkaListenerEndpointRegistry.class
+                );
+
+
+        long deadline =
+                System.currentTimeMillis() + 20_000;
+
+
+        while (System.currentTimeMillis() < deadline) {
+
+            for (MessageListenerContainer listenerContainer :
+                    registry.getListenerContainers()) {
+
+
+                String[] topics =
+                        listenerContainer
+                                .getContainerProperties()
+                                .getTopics();
+
+
+                if (topics == null) {
+                    continue;
+                }
+
+
+                /*
+                 * Find the application listener consuming:
+                 *
+                 * order-events
+                 */
+                boolean orderEventsListener =
+                        false;
+
+
+                for (String topic : topics) {
+
+                    if ("order-events".equals(topic)) {
+
+                        orderEventsListener =
+                                true;
+
+                        break;
+                    }
+                }
+
+
+                if (!orderEventsListener) {
+                    continue;
+                }
+
+
+                /*
+                 * OrderEventConsumer uses a
+                 * ConcurrentKafkaListenerContainerFactory.
+                 *
+                 * Therefore the parent listener container may
+                 * contain multiple child Kafka consumers.
+                 */
+                if (listenerContainer
+                        instanceof ConcurrentMessageListenerContainer<?, ?>
+                        concurrentContainer) {
+
+
+                    int totalAssigned =
+                            concurrentContainer
+                                    .getContainers()
+                                    .stream()
+                                    .mapToInt(
+                                            child ->
+                                                    child
+                                                            .getAssignedPartitions()
+                                                            .size()
+                                    )
+                                    .sum();
+
+
+                    /*
+                     * We require at least one assignment.
+                     *
+                     * Do NOT require three here.
+                     *
+                     * Your current local order-events topic has
+                     * only one partition.
+                     */
+                    if (totalAssigned > 0) {
+
+                        System.out.println(
+                                "\nMain order-events listener ready. "
+                                        + "Assigned partitions: "
+                                        + totalAssigned
+                                        + "\n"
+                        );
+
+                        return;
+                    }
+
+                } else {
+
+
+                    /*
+                     * Fallback if the application listener is
+                     * later changed to a non-concurrent
+                     * listener container.
+                     */
+                    if (!listenerContainer
+                            .getAssignedPartitions()
+                            .isEmpty()) {
+
+                        return;
+                    }
+                }
+            }
+
+
+            Thread.sleep(100);
+        }
+
+
+        fail(
+                "Main order-events Kafka listener did not receive "
+                        + "a partition assignment within 20 seconds"
+        );
+    }
+
+
+    /*
+     * ============================================================
+     * WAIT FOR A SPECIFIC EVENT IN DLT
+     * ============================================================
+     *
+     * We do NOT assume that every record observed in the shared
+     * DLT belongs to this test.
+     *
+     * Instead we search specifically for this test's:
+     *
+     * eventId
+     *
+     * and
+     *
+     * Kafka key.
+     */
+    private boolean waitForEventInDlt(
+            BlockingQueue<ConsumerRecord<String, String>> dltRecords,
+            String expectedKey,
+            String expectedEventId,
+            long timeout,
+            TimeUnit timeUnit
+    ) throws InterruptedException {
+
+
+        long deadline =
+                System.currentTimeMillis()
+                        + timeUnit.toMillis(timeout);
+
+
+        while (System.currentTimeMillis() < deadline) {
+
+            long remaining =
+                    deadline
+                            - System.currentTimeMillis();
+
+
+            if (remaining <= 0) {
+                break;
+            }
+
+
+            ConsumerRecord<String, String> record =
+                    dltRecords.poll(
+                            Math.min(
+                                    remaining,
+                                    500
+                            ),
+                            TimeUnit.MILLISECONDS
+                    );
+
+
+            if (record == null) {
+                continue;
+            }
+
+
+            /*
+             * Ignore DLT records belonging to other tests.
+             */
+            if (
+                    expectedKey.equals(
+                            record.key()
+                    )
+                            &&
+                            record.value() != null
+                            &&
+                            record
+                                    .value()
+                                    .contains(expectedEventId)
+            ) {
+
+                return true;
+            }
+        }
+
+
+        return false;
+    }
+
+
+    /*
+     * ============================================================
+     * RETRY SUCCESS TEST
+     * ============================================================
+     *
+     * Expected behavior:
+     *
+     * Kafka event
+     *      ↓
+     * attempt #1
+     *      ↓
+     * RuntimeException
+     *      ↓
+     * DefaultErrorHandler
+     *      ↓
+     * retry
+     *      ↓
+     * attempt #2
+     *      ↓
+     * SUCCESS
+     *      ↓
+     * no DLT
+     */
     @Test
-    void shouldRetryBusinessFailureAndEventuallySendEventToDlt()
+    void shouldSucceedOnRetryAndNotSendEventToDlt()
             throws Exception {
 
-        /*
-         * Kafka listener thread adds records here.
-         *
-         * JUnit thread retrieves them from here.
-         */
-        BlockingQueue<ConsumerRecord<String, String>> records =
+
+        BlockingQueue<ConsumerRecord<String, String>> dltRecords =
                 new LinkedBlockingQueue<>();
 
 
-        ConsumerFactory<String, String> consumerFactory =
+        ConsumerFactory<String, String> dltConsumerFactory =
                 createDltConsumerFactory();
 
 
         /*
-         * This manually-created listener listens only
-         * to the dead-letter topic.
+         * Manual observer for:
+         *
+         * order-events.DLT
          */
         ContainerProperties containerProperties =
                 new ContainerProperties(
@@ -149,43 +450,46 @@ class OrderEventRetryDltIntegrationTest {
                 );
 
 
-        KafkaMessageListenerContainer<String, String> container =
+        KafkaMessageListenerContainer<String, String> dltContainer =
                 new KafkaMessageListenerContainer<>(
-                        consumerFactory,
+                        dltConsumerFactory,
                         containerProperties
                 );
 
 
         /*
-         * Whenever the DLT consumer gets a message,
-         * place it into the BlockingQueue.
+         * Whenever the observer receives a DLT record,
+         * place it into our thread-safe queue.
          */
-        container.setupMessageListener(
-                (MessageListener<String, String>) record ->
-                        records.add(record)
+        dltContainer.setupMessageListener(
+                (MessageListener<String, String>) dltRecords::add
         );
 
 
         /*
-         * Start listening to the DLT before
-         * sending the test message.
+         * Start the DLT observer before publishing our
+         * normal Kafka event.
          */
-        container.start();
+        dltContainer.start();
 
 
         /*
-         * Wait until Kafka assigns partitions
-         * to this test consumer.
+         * ========================================================
+         * WAIT FOR DLT OBSERVER
+         * ========================================================
          */
-        long assignmentDeadline =
-                System.currentTimeMillis() + 10_000;
+        long dltAssignmentDeadline =
+                System.currentTimeMillis()
+                        + 10_000;
 
 
         while (
-                container.getAssignedPartitions().isEmpty()
+                dltContainer
+                        .getAssignedPartitions()
+                        .isEmpty()
                         &&
                         System.currentTimeMillis()
-                                < assignmentDeadline
+                                < dltAssignmentDeadline
         ) {
 
             Thread.sleep(100);
@@ -193,7 +497,9 @@ class OrderEventRetryDltIntegrationTest {
 
 
         assertFalse(
-                container.getAssignedPartitions().isEmpty(),
+                dltContainer
+                        .getAssignedPartitions()
+                        .isEmpty(),
                 "DLT consumer did not receive partition assignment"
         );
 
@@ -201,56 +507,114 @@ class OrderEventRetryDltIntegrationTest {
         try {
 
             /*
-             * Unique event ID for this test execution.
+             * ====================================================
+             * CREATE UNIQUE TEST EVENT
+             * ====================================================
              */
             String eventId =
-                    "retry-dlt-test-"
+                    "retry-success-test-"
                             + System.nanoTime();
 
 
-            /*
-             * Stable Kafka key.
-             */
             String key =
-                    "product-123";
+                    "product-456";
 
 
-            /*
-             * This payload is VALID JSON.
-             *
-             * Therefore:
-             *
-             * JSON deserialization should succeed.
-             *
-             * The failure will happen later,
-             * inside processingService.process(...).
-             */
             String payload =
                     """
                     {
                       "eventId": "%s",
                       "eventType": "PRODUCT_PURCHASED",
-                      "productId": 123,
+                      "productId": 456,
                       "quantity": 1,
-                      "occurredAt": "2026-09-05T18:00:00Z"
+                      "occurredAt": "2026-09-05T19:00:00Z"
                     }
                     """.formatted(eventId);
 
 
             /*
-             * Simulate a retryable business-processing failure.
-             *
-             * Every call to:
-             *
-             * processingService.process(...)
-             *
-             * throws RuntimeException.
+             * Counts processing attempts only for THIS event.
              */
-            doThrow(
-                    new RuntimeException(
+            AtomicInteger attempts =
+                    new AtomicInteger(0);
+
+
+            /*
+             * ====================================================
+             * MOCK BUSINESS PROCESSING
+             * ====================================================
+             *
+             * Attempt #1:
+             *
+             * throw RuntimeException
+             *
+             * Attempt #2:
+             *
+             * return normally
+             */
+            doAnswer(invocation -> {
+
+                OrderEvent event =
+                        invocation.getArgument(0);
+
+
+                /*
+                 * Ignore unrelated records that might be
+                 * consumed from the shared Kafka topic.
+                 */
+                if (
+                        event == null
+                                ||
+                                !eventId.equals(
+                                        event.getEventId()
+                                )
+                ) {
+
+                    return null;
+                }
+
+
+                int attempt =
+                        attempts.incrementAndGet();
+
+
+                System.out.println(
+                        "\nProcessing event "
+                                + eventId
+                                + " - attempt #"
+                                + attempt
+                );
+
+
+                /*
+                 * First processing attempt fails.
+                 */
+                if (attempt == 1) {
+
+                    System.out.println(
+                            "Attempt #1 intentionally failing"
+                    );
+
+
+                    throw new RuntimeException(
                             "Simulated temporary processing failure"
-                    )
-            )
+                    );
+                }
+
+
+                /*
+                 * Second attempt succeeds.
+                 */
+                System.out.println(
+                        "Attempt #"
+                                + attempt
+                                + " succeeded"
+                );
+
+
+                return null;
+
+            })
                     .when(processingService)
                     .process(
                             any(OrderEvent.class)
@@ -258,272 +622,199 @@ class OrderEventRetryDltIntegrationTest {
 
 
             /*
-             * Send the valid event to the normal Kafka topic.
+             * ====================================================
+             * WAIT FOR REAL APPLICATION LISTENER
+             * ====================================================
+             *
+             * This replaces:
+             *
+             * Thread.sleep(2000)
+             *
+             * We now know the listener actually owns a Kafka
+             * partition before publishing the event.
              */
-            kafkaTemplate
-                    .send(
-                            "order-events",
-                            key,
-                            payload
-                    )
-                    .get(
-                            10,
-                            TimeUnit.SECONDS
-                    );
+            waitForMainKafkaListenerAssignment();
 
 
-            /*
-             * Wait for the event to eventually appear in the DLT.
-             *
-             * Your observed retry behavior was:
-             *
-             * attempt 1
-             * retry 1
-             * retry 2
-             *
-             * = 3 processing attempts total
-             *
-             * Then the record is recovered to the DLT.
-             */
-            ConsumerRecord<String, String> dltRecord =
-                    records.poll(
-                            20,
-                            TimeUnit.SECONDS
-                    );
+            System.out.println(
+                    "\nSending retry-success event..."
+            );
 
 
-            assertNotNull(
-                    dltRecord,
-                    "Expected failed event in DLT after retries"
+            System.out.println(
+                    "Event ID : "
+                            + eventId
+            );
+
+
+            System.out.println(
+                    "Kafka Key: "
+                            + key
             );
 
 
             /*
-             * Verify original key is preserved.
+             * ====================================================
+             * PUBLISH EVENT
+             * ====================================================
+             */
+            var sendResult =
+                    kafkaTemplate
+                            .send(
+                                    "order-events",
+                                    key,
+                                    payload
+                            )
+                            .get(
+                                    10,
+                                    TimeUnit.SECONDS
+                            );
+
+
+            System.out.println(
+                    "Partition: "
+                            + sendResult
+                            .getRecordMetadata()
+                            .partition()
+            );
+
+
+            System.out.println(
+                    "Offset   : "
+                            + sendResult
+                            .getRecordMetadata()
+                            .offset()
+            );
+
+
+            /*
+             * ====================================================
+             * WAIT FOR RETRY SUCCESS
+             * ====================================================
+             */
+            long retryDeadline =
+                    System.currentTimeMillis()
+                            + 15_000;
+
+
+            while (
+                    attempts.get() < 2
+                            &&
+                            System.currentTimeMillis()
+                                    < retryDeadline
+            ) {
+
+                Thread.sleep(100);
+            }
+
+
+            System.out.println(
+                    "\nAttempts observed: "
+                            + attempts.get()
+            );
+
+
+            /*
+             * ====================================================
+             * VERIFY EXACTLY TWO ATTEMPTS
+             * ====================================================
+             *
+             * attempt #1 -> failure
+             *
+             * attempt #2 -> success
              */
             assertEquals(
-                    key,
-                    dltRecord.key()
+                    2,
+                    attempts.get(),
+                    "Expected first processing attempt to fail "
+                            + "and second attempt to succeed"
             );
 
 
             /*
-             * Verify original payload is preserved.
-             */
-            assertEquals(
-                    payload,
-                    dltRecord.value()
-            );
-
-
-            /*
-             * IMPORTANT:
-             *
-             * Your actual runtime showed:
-             *
-             * Wanted: 4
-             * Actual: 3
-             *
-             * Therefore we verify the behavior
-             * that is actually configured and running.
+             * Verify Mockito also observed exactly two calls
+             * for THIS event.
              */
             verify(
                     processingService,
-                    times(3)
+                    times(2)
             )
                     .process(
-                            any(OrderEvent.class)
+                            argThat(event ->
+                                    event != null
+                                            &&
+                                            eventId.equals(
+                                                    event.getEventId()
+                                            )
+                            )
                     );
 
 
             /*
-             * Print the DLT record itself.
+             * ====================================================
+             * VERIFY EVENT DID NOT REACH DLT
+             * ====================================================
+             *
+             * Since attempt #2 succeeded, the
+             * DeadLetterPublishingRecoverer should never be
+             * invoked for this event.
              */
-            System.out.println(
-                    "\n========== RETRY DLT RESULT =========="
-            );
-
-            System.out.println(
-                    "DLT Topic     : "
-                            + dltRecord.topic()
-            );
-
-            System.out.println(
-                    "DLT Partition : "
-                            + dltRecord.partition()
-            );
-
-            System.out.println(
-                    "DLT Offset    : "
-                            + dltRecord.offset()
-            );
-
-            System.out.println(
-                    "Key           : "
-                            + dltRecord.key()
-            );
-
-            System.out.println(
-                    "Value         : "
-                            + dltRecord.value()
-            );
+            boolean reachedDlt =
+                    waitForEventInDlt(
+                            dltRecords,
+                            key,
+                            eventId,
+                            4,
+                            TimeUnit.SECONDS
+                    );
 
 
-            /*
-             * Print and correctly decode DLT headers.
-             */
-            System.out.println(
-                    "\n---------- HEADERS ----------"
-            );
-
-
-            dltRecord
-                    .headers()
-                    .forEach(header -> {
-
-                        String headerKey =
-                                header.key();
-
-                        byte[] value =
-                                header.value();
-
-
-                        if (value == null) {
-
-                            System.out.println(
-                                    headerKey + " = null"
-                            );
-
-                            return;
-                        }
-
-
-                        switch (headerKey) {
-
-                            /*
-                             * Partition is stored as an int.
-                             *
-                             * int = 4 bytes
-                             */
-                            case "kafka_dlt-original-partition" -> {
-
-                                int originalPartition =
-                                        ByteBuffer
-                                                .wrap(value)
-                                                .getInt();
-
-                                System.out.println(
-                                        headerKey
-                                                + " = "
-                                                + originalPartition
-                                );
-                            }
-
-
-                            /*
-                             * Offset is stored as a long.
-                             *
-                             * long = 8 bytes
-                             */
-                            case "kafka_dlt-original-offset" -> {
-
-                                long originalOffset =
-                                        ByteBuffer
-                                                .wrap(value)
-                                                .getLong();
-
-                                System.out.println(
-                                        headerKey
-                                                + " = "
-                                                + originalOffset
-                                );
-                            }
-
-
-                            /*
-                             * Kafka record timestamp is also
-                             * represented as a long.
-                             *
-                             * It is epoch milliseconds.
-                             */
-                            case "kafka_dlt-original-timestamp" -> {
-
-                                long originalTimestamp =
-                                        ByteBuffer
-                                                .wrap(value)
-                                                .getLong();
-
-
-                                Instant timestampAsInstant =
-                                        Instant.ofEpochMilli(
-                                                originalTimestamp
-                                        );
-
-
-                                System.out.println(
-                                        headerKey
-                                                + " = "
-                                                + originalTimestamp
-                                                + " ("
-                                                + timestampAsInstant
-                                                + ")"
-                                );
-                            }
-
-
-                            /*
-                             * Most of the remaining DLT headers
-                             * are textual values.
-                             *
-                             * Examples:
-                             *
-                             * exception class
-                             * exception message
-                             * original topic
-                             * timestamp type
-                             * consumer group
-                             */
-                            default -> {
-
-                                String text =
-                                        new String(
-                                                value,
-                                                StandardCharsets.UTF_8
-                                        );
-
-
-                                System.out.println(
-                                        headerKey
-                                                + " = "
-                                                + text
-                                );
-                            }
-                        }
-                    });
-
-
-            System.out.println(
-                    "-----------------------------"
+            assertFalse(
+                    reachedDlt,
+                    "Event succeeded on retry and should not reach DLT"
             );
 
 
             System.out.println(
-                    "\nProcessing attempts verified: 3"
+                    "\n========== RETRY SUCCESS RESULT =========="
             );
 
 
             System.out.println(
-                    "======================================\n"
+                    "Event ID            : "
+                            + eventId
+            );
+
+
+            System.out.println(
+                    "Processing attempts : "
+                            + attempts.get()
+            );
+
+
+            System.out.println(
+                    "Reached DLT         : "
+                            + reachedDlt
+            );
+
+
+            System.out.println(
+                    "Result              : SUCCESS ON RETRY"
+            );
+
+
+            System.out.println(
+                    "==========================================\n"
             );
 
         } finally {
 
             /*
-             * Always stop the manually-created DLT consumer.
+             * Always stop the manually-created DLT observer.
              *
-             * This executes even if an assertion fails.
+             * This executes even when the test fails.
              */
-            container.stop();
+            dltContainer.stop();
         }
     }
 }
