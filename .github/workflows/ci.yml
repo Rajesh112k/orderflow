@@ -1,14 +1,17 @@
-name: OrderFlow CI
+name: OrderFlow CI/CD
 
 on:
   push:
     branches:
       - main
+
   pull_request:
     branches:
       - main
 
+
 jobs:
+
   test:
     name: Build and Test
     runs-on: ubuntu-latest
@@ -57,6 +60,7 @@ jobs:
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
           KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
           KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
 
     steps:
 
@@ -122,5 +126,46 @@ jobs:
             --describe \
             --topic order-events.DLT
 
+
       - name: Build and test
         run: ./mvnw clean test -DforkCount=1 -DreuseForks=true
+
+
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+
+    needs:
+      - test
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: orderflowrajesh2026.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            orderflowrajesh2026.azurecr.io/orderflow:${{ github.sha }}
+            orderflowrajesh2026.azurecr.io/orderflow:latest
