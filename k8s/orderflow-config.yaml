@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orderflow-config
+data:
+  DB_URL: "jdbc:postgresql://postgres:5432/orderflow"
+  DB_USERNAME: "postgres"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"

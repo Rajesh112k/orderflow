@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderflow
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: orderflow
+
+  template:
+    metadata:
+      labels:
+        app: orderflow
+
+    spec:
+      imagePullSecrets:
+        - name: acr-secret
+
+      containers:
+        - name: orderflow
+          image: orderflowrajesh2026.azurecr.io/orderflow:aks-1
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8080
+
+          env:
+            - name: DB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: orderflow-config
+                  key: DB_URL
+
+            - name: DB_USERNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: orderflow-config
+                  key: DB_USERNAME
+
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: orderflow-db-secret
+                  key: POSTGRES_PASSWORD
+
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: orderflow-config
+                  key: KAFKA_BOOTSTRAP_SERVERS
+
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 6
+
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
