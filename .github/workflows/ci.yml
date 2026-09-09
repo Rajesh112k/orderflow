@@ -89,6 +89,5 @@ jobs:
           echo "Kafka did not start"
           exit 1
 
-
       - name: Build and test
-        run: ./mvnw clean test
+        run: ./mvnw clean test -DforkCount=1 -DreuseForks=true
