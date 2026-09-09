@@ -89,5 +89,38 @@ jobs:
           echo "Kafka did not start"
           exit 1
 
+
+      - name: Create Kafka topics
+        run: |
+          docker exec ${{ job.services.kafka.id }} \
+            /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create \
+            --if-not-exists \
+            --topic order-events \
+            --partitions 3 \
+            --replication-factor 1
+
+          docker exec ${{ job.services.kafka.id }} \
+            /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create \
+            --if-not-exists \
+            --topic order-events.DLT \
+            --partitions 3 \
+            --replication-factor 1
+
+          docker exec ${{ job.services.kafka.id }} \
+            /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --describe \
+            --topic order-events
+
+          docker exec ${{ job.services.kafka.id }} \
+            /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --describe \
+            --topic order-events.DLT
+
       - name: Build and test
         run: ./mvnw clean test -DforkCount=1 -DreuseForks=true
