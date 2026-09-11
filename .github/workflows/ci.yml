@@ -222,6 +222,12 @@ jobs:
 
           echo "AKS nodes:"
           kubectl get nodes
+          
+      - name: Apply OrderFlow Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/orderflow-config.yaml
+          kubectl apply -f k8s/orderflow-service.yaml
+          kubectl apply -f k8s/orderflow-deployment.yaml
 
       - name: Deploy new image to AKS
         run: |
