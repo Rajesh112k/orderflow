@@ -36,17 +36,7 @@ public class OrderEventProcessingService {
          *      ↓
          * DLT
          */
-        if (Long.valueOf(999L).equals(event.getProductId())) {
 
-            System.out.println(
-                    "Simulating failure for event: "
-                            + event.getEventId()
-            );
-
-            throw new RuntimeException(
-                    "Simulated permanent failure"
-            );
-        }
 
         /*
          * IDEMPOTENCY CHECK
