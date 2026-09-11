@@ -244,3 +244,37 @@ jobs:
             -o=jsonpath='{.spec.template.spec.containers[0].image}'
 
           echo ""
+      - name: Verify deployment
+        run: |
+          echo "OrderFlow pods:"
+          kubectl get pods -l app=orderflow
+
+          echo ""
+          echo "Deployed image:"
+          kubectl get deployment orderflow \
+            -o=jsonpath='{.spec.template.spec.containers[0].image}'
+
+          echo ""
+
+      - name: Smoke test live API
+        shell: bash
+        run: |
+          ORDERFLOW_IP=$(kubectl get service orderflow-service \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+          echo "Testing OrderFlow at $ORDERFLOW_IP"
+
+          for i in {1..10}; do
+            if curl --fail --silent --show-error \
+              "http://$ORDERFLOW_IP/products/1"; then
+              echo ""
+              echo "Smoke test passed"
+              exit 0
+            fi
+
+            echo "Application not ready yet. Retrying..."
+            sleep 10
+          done
+
+          echo "Smoke test failed"
+          exit 1
