@@ -22,7 +22,7 @@ public class SecurityConfig {
                         ).permitAll()
                         .requestMatchers("/actuator/**").authenticated()
                         .requestMatchers("/products/**").permitAll()
-                        .anyRequest().permitAll()
+                        .anyRequest().denyAll()
                 )
                 .httpBasic(Customizer.withDefaults());
 
