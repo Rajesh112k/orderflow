@@ -20,7 +20,7 @@ spec:
 
       containers:
         - name: orderflow
-          image: orderflowrajesh2026.azurecr.io/orderflow:aks-1
+          image: orderflowrajesh2026.azurecr.io/orderflow:latest
           imagePullPolicy: Always
 
           ports:
@@ -50,6 +50,17 @@ spec:
                 configMapKeyRef:
                   name: orderflow-config
                   key: KAFKA_BOOTSTRAP_SERVERS
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: orderflow-admin-secret
+                  key: ADMIN_USERNAME
+
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: orderflow-admin-secret
+                  key: ADMIN_PASSWORD
 
           readinessProbe:
             httpGet:
