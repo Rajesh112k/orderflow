@@ -220,14 +220,16 @@ jobs:
           echo "Current Kubernetes context:"
           kubectl config current-context
 
+          echo ""
           echo "AKS nodes:"
           kubectl get nodes
-          
+
       - name: Apply OrderFlow Kubernetes manifests
         run: |
           kubectl apply -f k8s/orderflow-config.yaml
           kubectl apply -f k8s/orderflow-service.yaml
           kubectl apply -f k8s/orderflow-deployment.yaml
+          kubectl apply -f k8s/orderflow-ingress.yaml
 
       - name: Deploy new image to AKS
         run: |
@@ -247,46 +249,122 @@ jobs:
           echo ""
           echo "Deployed image:"
           kubectl get deployment orderflow \
-            -o=jsonpath='{.spec.template.spec.containers[0].image}'
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
 
           echo ""
-      - name: Verify deployment
-        run: |
-          echo "OrderFlow pods:"
-          kubectl get pods -l app=orderflow
-
-          echo ""
-          echo "Deployed image:"
-          kubectl get deployment orderflow \
-            -o=jsonpath='{.spec.template.spec.containers[0].image}'
-
           echo ""
 
-      - name: Smoke test live API
+          echo "OrderFlow service:"
+          kubectl get service orderflow-service
+
+          echo ""
+          echo "OrderFlow ingress:"
+          kubectl get ingress orderflow-ingress
+
+      - name: Smoke test live API through Ingress
         shell: bash
         run: |
-          ORDERFLOW_IP=$(kubectl get service orderflow-service \
-            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Waiting for Ingress external IP..."
 
-          echo "Testing OrderFlow at $ORDERFLOW_IP"
+          INGRESS_IP=""
+
+          for i in {1..18}; do
+            INGRESS_IP=$(kubectl get ingress orderflow-ingress \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+              2>/dev/null || true)
+
+            if [ -n "$INGRESS_IP" ]; then
+              echo "Ingress IP: $INGRESS_IP"
+              break
+            fi
+
+            echo "Ingress IP not ready yet..."
+            sleep 10
+          done
+
+          if [ -z "$INGRESS_IP" ]; then
+            echo "Ingress did not receive an external IP"
+            exit 1
+          fi
+
+          echo ""
+          echo "Testing health endpoint through Ingress..."
 
           for i in {1..10}; do
-            if curl --fail --silent --show-error \
-              "http://$ORDERFLOW_IP/products/1"; then
-              echo ""
-              echo "Smoke test passed"
-              exit 0
+            STATUS=$(curl \
+              --silent \
+              --output /dev/null \
+              --write-out "%{http_code}" \
+              "http://$INGRESS_IP/actuator/health" \
+              || true)
+
+            echo "Health status: $STATUS"
+
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed"
+              break
+            fi
+
+            if [ "$i" = "10" ]; then
+              echo "Health check failed"
+              exit 1
             fi
 
             echo "Application not ready yet. Retrying..."
             sleep 10
           done
 
-          echo "Smoke test failed"
-          exit 1
+          echo ""
+          echo "Testing public product endpoint..."
+
+          PRODUCT_STATUS=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            "http://$INGRESS_IP/products/1" \
+            || true)
+
+          echo "Product endpoint status: $PRODUCT_STATUS"
+
+          if [ "$PRODUCT_STATUS" != "200" ]; then
+            echo "Product endpoint smoke test failed"
+            exit 1
+          fi
+
+          echo ""
+          echo "Testing that admin endpoint is NOT publicly routed..."
+
+          ADMIN_STATUS=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --request POST \
+            "http://$INGRESS_IP/admin/dlt/replay/10" \
+            || true)
+
+          echo "Admin route status: $ADMIN_STATUS"
+
+          if [ "$ADMIN_STATUS" = "200" ] || \
+             [ "$ADMIN_STATUS" = "401" ] || \
+             [ "$ADMIN_STATUS" = "403" ] || \
+             [ "$ADMIN_STATUS" = "409" ]; then
+
+            echo "ERROR: /admin appears to be reaching the OrderFlow application through the public Ingress"
+            exit 1
+          fi
+
+          echo ""
+          echo "Smoke tests passed"
+          echo "Health endpoint is public"
+          echo "Product endpoint is public"
+          echo "Admin endpoint is not routed through public Ingress"
+
       - name: Roll back deployment on failure
         if: failure()
         run: |
           echo "Deployment failed. Rolling back..."
+
           kubectl rollout undo deployment/orderflow
-          kubectl rollout status deployment/orderflow --timeout=180s
+
+          kubectl rollout status deployment/orderflow \
+            --timeout=180s
