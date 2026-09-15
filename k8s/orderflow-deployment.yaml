@@ -15,6 +15,9 @@ spec:
         app: orderflow
 
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+
       imagePullSecrets:
         - name: acr-secret
       securityContext:
@@ -109,4 +112,5 @@ spec:
 
       volumes:
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 256Mi
