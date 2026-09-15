@@ -232,6 +232,7 @@ jobs:
           kubectl apply -f k8s/orderflow-ingress.yaml
           kubectl apply -f k8s/orderflow-pdb.yaml
           kubectl apply -f k8s/orderflow-hpa.yaml
+          kubectl apply -f k8s/orderflow-network-policy.yaml
 
       - name: Deploy new image to AKS
         run: |
