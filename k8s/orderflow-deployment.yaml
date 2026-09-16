@@ -5,6 +5,12 @@ metadata:
 spec:
   replicas: 2
 
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
   selector:
     matchLabels:
       app: orderflow
@@ -15,6 +21,13 @@ spec:
         app: orderflow
 
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: orderflow
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 40
 
@@ -51,15 +64,33 @@ spec:
 
             - name: DB_USERNAME
               valueFrom:
-                configMapKeyRef:
-                  name: orderflow-config
-                  key: DB_USERNAME
+                secretKeyRef:
+                  name: orderflow-app-db-secret
+                  key: username
 
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: orderflow-db-secret
-                  key: POSTGRES_PASSWORD
+                  name: orderflow-app-db-secret
+                  key: password
+
+            - name: FLYWAY_DB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: orderflow-config
+                  key: DB_URL
+
+            - name: FLYWAY_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: orderflow-migrator-db-secret
+                  key: username
+
+            - name: FLYWAY_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: orderflow-migrator-db-secret
+                  key: password
 
             - name: KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
